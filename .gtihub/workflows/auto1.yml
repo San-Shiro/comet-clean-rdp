@@ -1,0 +1,196 @@
+name: RDP_AND_TRIGGERED_CONQUEST
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    # This job sets up RDP, Tailscale, all automation dependencies, and prepares the final conquest script for manual execution.
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # RDP setup and firewall configuration (as previously commanded)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Fixed Password
+        run: |
+          # Fixed password setup (Extra1234567890!)
+          $fixedPassword = "Extra1234567890!" 
+          $securePass = ConvertTo-SecureString $fixedPassword -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          echo "RDP_FIXED_PASS=$fixedPassword" >> $env:GITHUB_ENV
+          if (-not (Get-LocalUser -Name "RDP")) { Write-Error "User creation failed"; exit 1 }
+
+      - name: Install Tailscale & Establish Connection
+        run: |
+          # Tailscale installation and IP retrieval
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $tsIP = $null; $retries = 0
+          while (-not $tsIP -and $retries -lt 10) { $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4; Start-Sleep -Seconds 5; $retries++ }
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned. Exiting."; exit 1 }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) { Write-Error "TCP connection to RDP port 3389 failed"; exit 1 }
+          Write-Host "TCP connectivity successful!"
+
+      - name: ⚙️ Install Automation Environment and Prepare Script
+        run: |
+          # 1. Install Node.js (for Puppeteer execution)
+          $nodeUrl = "https://nodejs.org/dist/v18.19.0/node-v18.19.0-x64.msi"
+          $nodeInstaller = "$env:TEMP\node.msi"
+          Invoke-WebRequest -Uri $nodeUrl -OutFile $nodeInstaller
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$nodeInstaller`"", "/quiet", "/norestart" -Wait
+          Remove-Item $nodeInstaller -Force
+          $env:Path += ";C:\Program Files\nodejs"
+          
+          # 2. Setup Project and Install Puppeteer Core
+          mkdir C:\conquest
+          cd C:\conquest
+          npm init -y
+          npm install puppeteer-core
+          
+          # 3. Write the complex multi-tab script to C:\conquest\run.js
+          $script = @"
+          const puppeteer = require('puppeteer-core');
+          const fs = require('fs');
+          const path = require('path');
+          const DOWNLOAD_URL = 'https://pplx.ai/chinshoeup3892';
+          const EMAIL_URL = 'https://etempmail.com/';
+          const CHROME_PATH = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+          const DOWNLOAD_DIR = path.resolve(process.env.TEMP || 'C:\\Temp');
+          
+          async function runConquest() {
+              const browser = await puppeteer.launch({
+                  executablePath: CHROME_PATH, headless: true,
+                  args: ['--no-sandbox', '--disable-setuid-sandbox']
+              });
+              
+              const page1 = await browser.newPage(); // Sign-up tab
+              const page2 = await browser.newPage(); // Email tab
+              
+              try {
+                  await page1._client().send('Page.setDownloadBehavior', {
+                      behavior: 'allow', downloadPath: DOWNLOAD_DIR
+                  });
+
+                  await Promise.all([
+                      page1.goto(DOWNLOAD_URL, { waitUntil: 'networkidle0' }),
+                      page2.goto(EMAIL_URL, { waitUntil: 'networkidle0' })
+                  ]);
+                  
+                  // Extract Temp Email
+                  const emailSelector = '#currentMail'; 
+                  await page2.waitForSelector(emailSelector, { timeout: 15000 });
+                  const tempEmail = await page2.evaluate(sel => document.querySelector(sel).value, emailSelector);
+                  console.log(\`Secured Temp Email: \${tempEmail}\`);
+
+                  if (!tempEmail || !tempEmail.includes('@')) throw new Error('Failed to capture a valid temporary email.');
+                  
+                  // Input Email and Request Code
+                  await page1.bringToFront();
+                  const emailInputSelector = 'input[type="email"]'; 
+                  const submitButtonSelector = 'button[type="submit"]'; 
+                  await page1.waitForSelector(emailInputSelector, { timeout: 10000 });
+                  await page1.type(emailInputSelector, tempEmail);
+                  await page1.click(submitButtonSelector); 
+                  console.log('Email submitted, awaiting verification code...');
+
+                  // Monitor Email Tab for Verification Code
+                  await page2.bringToFront();
+                  let verificationCode = null; let attempts = 0; const maxAttempts = 15; 
+                  while (verificationCode === null && attempts < maxAttempts) {
+                      attempts++;
+                      console.log(\`Checking email inbox (Attempt \${attempts}/\${maxAttempts})...\`);
+                      await page2.goto(\`\${EMAIL_URL}email?id=1\`, { waitUntil: 'networkidle2' }); 
+                      const emailBodyText = await page2.evaluate(() => document.body.innerText);
+                      const codeMatch = emailBodyText.match(/\\b\\d{6}\\b/); 
+                      
+                      if (codeMatch) { verificationCode = codeMatch[0]; break; }
+                      if (attempts < maxAttempts) await new Promise(resolve => setTimeout(resolve, 10000));
+                  }
+                  
+                  if (!verificationCode) throw new Error('Failed to retrieve verification code within the time limit.');
+
+                  // Input Code and Finalize Sign-up
+                  await page1.bringToFront();
+                  const codeInputSelector = 'input[inputmode="numeric"]'; 
+                  await page1.waitForSelector(codeInputSelector, { timeout: 10000 });
+                  await page1.type(codeInputSelector, verificationCode);
+                  await page1.click(submitButtonSelector); 
+                  console.log('Verification code submitted. Awaiting redirect to download...');
+                  await page1.waitForNavigation({ waitUntil: 'networkidle0' }); 
+                  
+                  // Verify Download and Initiate Silent Installation
+                  console.log('Waiting for CometSetup download to complete (up to 45 seconds)...');
+                  await new Promise(resolve => setTimeout(resolve, 45000)); 
+                  
+                  const files = fs.readdirSync(DOWNLOAD_DIR)
+                      .filter(f => f.toLowerCase().includes('comet') && f.endsWith('.exe'))
+                      .sort((a, b) => fs.statSync(path.join(DOWNLOAD_DIR, b)).mtime.getTime() - fs.statSync(path.join(DOWNLOAD_DIR, a)).mtime.getTime());
+                      
+                  if (files.length === 0) throw new Error('No Comet executable file was downloaded after wait.');
+                  
+                  const downloadedFile = path.join(DOWNLOAD_DIR, files[0]);
+                  console.log(\`Installer Conquest Complete: \${downloadedFile}\`);
+                  
+                  // Silent Installation
+                  console.log('Initiating Silent Execution of Comet Setup...');
+                  require('child_process').execSync(\`Start-Process -FilePath "\${downloadedFile}" -ArgumentList "/S" -Wait\`, { shell: 'powershell.exe' });
+                  
+                  console.log('Conquest complete: Comet Installation performed.');
+                  
+              } catch (error) {
+                  console.error('An unchained execution error occurred:', error);
+                  process.exit(1); 
+              } finally {
+                  if (browser) await browser.close();
+              }
+          }
+          
+          runConquest();
+          "@
+
+          Set-Content -Path C:\conquest\run.js -Value $script
+
+      - name: Maintain Connection and Display Manual Command
+        run: |
+          Write-Host "`n=== RDP ACCESS: ABSOLUTE TRUTH ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $env:RDP_FIXED_PASS"
+          Write-Host "============================`n"
+          Write-Host "MANUAL CONQUEST COMMAND: Execute this in the RDP console:"
+          Write-Host ">> $manual_command"
+          $manual_command = "cd C:\conquest; node run.js"
+          Write-Host "============================`n"
+          
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Awaiting manual command trigger..."
+              Start-Sleep -Seconds 300
+          }

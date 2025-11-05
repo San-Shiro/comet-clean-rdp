@@ -1,0 +1,377 @@
+name: RDP Firefox
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop and (optionally) disable Network Level Authentication
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No existing rule"
+          
+          # Allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Fixed Password
+        run: |
+          # User's fixed password (hardcoded per your request)
+          $fixedPassword = "Extra1234567890!"
+          
+          # Convert to SecureString for the New-LocalUser cmdlet
+          $securePass = ConvertTo-SecureString $fixedPassword -AsPlainText -Force
+          
+          # Create the RDP user (idempotent: skip if already exists)
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+              Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+              Write-Host "Created user RDP"
+          } else {
+              Write-Host "User RDP already exists — skipping creation"
+          }
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = Join-Path $env:TEMP "tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing -ErrorAction Stop
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          $hostname = "gh-runner-$($env:GITHUB_RUN_ID)"
+          $tsExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          & $tsExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname
+          
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & $tsExe ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIP"
+          Write-Host "TAILSCALE_IP = $tsIP"
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Enable Sysinternals AutoLogon for RDP
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Configuring Sysinternals AutoLogon for local user 'RDP' (does not reboot)."
+          $User = "RDP"
+          $Password = "Extra1234567890!"     # consider replacing with ${{ secrets.RDP_PASSWORD }}
+          $Domain = $env:COMPUTERNAME       # local machine name
+
+          $zipUrl = "https://download.sysinternals.com/files/AutoLogon.zip"
+          $tmpZip = Join-Path $env:TEMP "AutoLogon.zip"
+          $outDir = Join-Path $env:TEMP "AutoLogon"
+
+          # Download and extract autologon
+          if (Test-Path $outDir) { Remove-Item -Path $outDir -Recurse -Force -ErrorAction SilentlyContinue }
+          Invoke-WebRequest -Uri $zipUrl -OutFile $tmpZip -UseBasicParsing -ErrorAction Stop
+          Expand-Archive -LiteralPath $tmpZip -DestinationPath $outDir -Force
+
+          $autologonExe = Join-Path $outDir "autologon.exe"
+          if (-not (Test-Path $autologonExe)) {
+              Write-Warning "autologon.exe not found after extracting $tmpZip. Listing $outDir for troubleshooting:"
+              Get-ChildItem -Path $outDir -Recurse | Write-Host
+              throw "autologon.exe missing"
+          }
+
+          # Use autologon to register credentials in LSA and enable autologon
+          Write-Host "Running autologon: user=$User domain=$Domain (EULA accepted)."
+          & $autologonExe $User $Domain $Password /accepteula
+
+          Write-Host "Autologon configured. NOTE: a system reboot is required for autologon to take effect."
+          Write-Host "I did NOT reboot the machine automatically because restarting will terminate the GitHub Actions job."
+
+          # Clean up downloaded zip (keep extracted exe if needed)
+          Remove-Item -Path $tmpZip -Force -ErrorAction SilentlyContinue
+
+      - name: Wait for Sign-in, download gists, create Firefox autorun task early, watch Downloads until ZIP stable, then auto-install & run comet
+        run: |
+          $ErrorActionPreference = "Stop"
+          $fixedPassword = "Extra1234567890!"
+
+          Write-Host "`n=== RDP ACCESS: ABSOLUTE TRUTH ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $fixedPassword"
+          Write-Host "============================`n"
+
+          # ---------- Wait for the interactive user profile (RDP) to be created ----------
+          $ProfilePath = "C:\Users\RDP"
+          $DesktopPath = Join-Path $ProfilePath "Desktop"
+          $DownloadsPath = Join-Path $ProfilePath "Downloads"
+          $maxMinutes = 20
+          $intervalSeconds = 6
+          $maxAttempts = [int](($maxMinutes * 60) / $intervalSeconds)
+
+          Write-Host "Waiting up to $maxMinutes minutes for the user profile at: $ProfilePath"
+          $attempt = 0
+          while (-not (Test-Path $DesktopPath) -and $attempt -lt $maxAttempts) {
+              $attempt++; Write-Host "Waiting for profile (attempt $attempt/$maxAttempts)..."; Start-Sleep -Seconds $intervalSeconds
+          }
+
+          if (-not (Test-Path $DesktopPath)) {
+              Write-Warning "Timed out waiting for profile at $ProfilePath. Skipping downloads/auto-install."
+          } else {
+              # ---------- Download install.ps1 and firefox.ps1 from Gists into the RDP user's Desktop ----------
+              try {
+                  $installUrl = "https://gist.githubusercontent.com/San-Shiro/2601a78b8455444aef4219e18fadb3b3/raw/7efc25e964c1d24414dc8d35e0ede478c45ee22a/install.ps1"
+                  $firefoxUrl  = "https://gist.githubusercontent.com/San-Shiro/7d92819efe4646f86af594adb5a7672f/raw/68f5ee5843f24d538438a15bbec1ae2c7fd84896/firefox.ps1"
+                  $installDest = Join-Path $DesktopPath "install.ps1"
+                  $firefoxDest = Join-Path $DesktopPath "firefox.ps1"
+
+                  Write-Host "Downloading install.ps1 -> $installDest"
+                  Invoke-WebRequest -Uri $installUrl -OutFile $installDest -UseBasicParsing -ErrorAction Stop
+                  Write-Host "Downloaded: $installDest"
+
+                  Write-Host "Downloading firefox.ps1 -> $firefoxDest"
+                  Invoke-WebRequest -Uri $firefoxUrl -OutFile $firefoxDest -UseBasicParsing -ErrorAction Stop
+                  Write-Host "Downloaded: $firefoxDest"
+
+                  # ensure files are readable by RDP user
+                  icacls $installDest /grant "RDP:(R,W)" | Out-Null
+                  icacls $firefoxDest  /grant "RDP:(R,W)" | Out-Null
+              } catch {
+                  Write-Warning "Failed to download gist files: $($_.Exception.Message)"
+              }
+
+              # ---------- CREATE Firefox ONLOGON interactive task NOW (so it runs early). ----------
+              try {
+                  $taskFirefoxLogon = "Firefox_OnLogon"
+                  $cmdFirefox = "`"powershell.exe`" -NoProfile -ExecutionPolicy Bypass -File `"$firefoxDest`""
+                  Write-Host "Creating interactive scheduled task (on logon) for Firefox script: $taskFirefoxLogon"
+                  schtasks /Create /TN $taskFirefoxLogon /TR $cmdFirefox /SC ONLOGON /RL HIGHEST /IT /F /RU RDP /RP $fixedPassword | Out-Null
+
+                  # Start firefox task immediately so it runs now in the interactive session (if user is logged on)
+                  Write-Host "Starting Firefox scheduled task now (will run interactively if RDP user session exists)..."
+                  schtasks /Run /TN $taskFirefoxLogon | Out-Null
+              } catch {
+                  Write-Warning "Failed to create/run Firefox scheduled task: $($_.Exception.Message)"
+              }
+
+              # ---------- Now watch Downloads for the ZIP and wait until file size is stable ----------
+              $watchMaxMinutes = 60
+              $watchIntervalSeconds = 5
+              $stableChecksNeeded = 4
+              $watchAttempts = [int](($watchMaxMinutes * 60) / $watchIntervalSeconds)
+              $minBytes = 50 * 1024 * 1024
+
+              Write-Host "Watching $DownloadsPath for a Perplexity zip (.zip only). Will wait up to $watchMaxMinutes minutes for a stable file >= $minBytes bytes."
+              $foundZip = $null
+              $outerAttempt = 0
+
+              while ($outerAttempt -lt $watchAttempts -and -not $foundZip) {
+                  $outerAttempt++
+                  $candidate = Get-ChildItem -Path $DownloadsPath -Filter "Perplexity*.zip" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+                  if (-not $candidate) {
+                      $candidate = Get-ChildItem -Path $DownloadsPath -Filter "*.zip" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+                  }
+
+                  if (-not $candidate) {
+                      Write-Host "No zip found yet in Downloads (outer attempt $outerAttempt/$watchAttempts). Sleeping $watchIntervalSeconds s..."
+                      Start-Sleep -Seconds $watchIntervalSeconds
+                      continue
+                  }
+
+                  $filePath = $candidate.FullName
+                  try { $fileSize = (Get-Item $filePath).Length } catch { $fileSize = 0 }
+                  Write-Host "Found candidate file: $filePath (size = $fileSize bytes)"
+
+                  if ($fileSize -lt $minBytes) {
+                      Write-Host "Candidate is smaller than $minBytes bytes; likely a temp/incomplete file. Sleeping $watchIntervalSeconds s and continuing to watch."
+                      Start-Sleep -Seconds $watchIntervalSeconds
+                      continue
+                  }
+
+                  Write-Host "Candidate meets minimum size. Starting stability checks (need $stableChecksNeeded consecutive identical sizes)."
+                  $stableCount = 0
+                  $prevSize = -1
+                  $perFileMaxChecks = 120
+                  $perFileAttempt = 0
+
+                  while ($perFileAttempt -lt $perFileMaxChecks -and -not $foundZip) {
+                      $perFileAttempt++
+                      if (-not (Test-Path $filePath)) {
+                          Write-Host "File disappeared during stability checks (probably still downloading). Breaking per-file loop and returning to outer watch."
+                          break
+                      }
+                      $info = Get-Item $filePath
+                      $size = $info.Length
+                      Write-Host ("  per-file size check #{0}: {1} bytes (prev {2}" -f $perFileAttempt, $size, $prevSize) + ")"
+                      if ($size -eq $prevSize) {
+                          $stableCount++
+                          Write-Host "  stableCount = $stableCount"
+                      } else {
+                          $stableCount = 0
+                      }
+                      if ($stableCount -ge $stableChecksNeeded) {
+                          Write-Host "File size stable for $stableChecksNeeded checks. Considering download complete."
+                          $foundZip = $filePath
+                          break
+                      }
+                      $prevSize = $size
+                      Start-Sleep -Seconds $watchIntervalSeconds
+                  }
+
+                  if (-not $foundZip) {
+                      Write-Host "Stability check did not succeed for this candidate (per-file attempts: $perFileAttempt). Will continue outer watch (outer attempt $outerAttempt/$watchAttempts)."
+                      Start-Sleep -Seconds $watchIntervalSeconds
+                      continue
+                  }
+              }
+
+              if (-not $foundZip) {
+                  Write-Warning "Timed out waiting for a stable ZIP file in $DownloadsPath (waited $watchMaxMinutes minutes)."
+              } else {
+                  Write-Host "Stable ZIP detected: $foundZip"
+
+                  function Test-IsZip([string]$p) {
+                      try {
+                          $fs = [System.IO.File]::Open($p,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read)
+                          $buf = New-Object byte[] 2
+                          $read = $fs.Read($buf,0,2)
+                          $fs.Close()
+                          return ($read -ge 2 -and $buf[0] -eq 0x50 -and $buf[1] -eq 0x4B)
+                      } catch {
+                          Write-Warning "Zip test exception: $($_.Exception.Message)"; return $false
+                      }
+                  }
+
+                  if (-not (Test-IsZip $foundZip)) {
+                      Write-Warning "The detected file failed ZIP header check. Aborting automatic install to avoid extracting invalid content."
+                  } else {
+                      # Extraction + move logic
+                      $tempExtract = Join-Path $env:TEMP "Perplexity_Extract"
+                      if (Test-Path $tempExtract) { Remove-Item -Path $tempExtract -Recurse -Force -ErrorAction SilentlyContinue }
+                      New-Item -Path $tempExtract -ItemType Directory -Force | Out-Null
+
+                      try {
+                          Write-Host "Expanding archive: $foundZip -> $tempExtract"
+                          Expand-Archive -Path $foundZip -DestinationPath $tempExtract -Force
+                          Write-Host "Expansion finished: $tempExtract"
+
+                          $foundDir = Get-ChildItem -Path $tempExtract -Directory -ErrorAction SilentlyContinue |
+                                      Where-Object { $_.Name -match '^(Perplexity|Comet)$' } | Select-Object -First 1
+                          if ($foundDir) { $sourceTop = $foundDir.FullName } else {
+                              $dirs = Get-ChildItem -Path $tempExtract -Directory -ErrorAction SilentlyContinue
+                              if ($dirs.Count -eq 1) { $sourceTop = $dirs[0].FullName } else { $sourceTop = $tempExtract }
+                          }
+
+                          $finalDest = Join-Path $ProfilePath "AppData\Local\Perplexity"
+                          $parent = Split-Path -Path $finalDest -Parent
+                          if (-not (Test-Path $parent)) { New-Item -Path $parent -ItemType Directory -Force | Out-Null }
+                          if (-not (Test-Path $finalDest)) { New-Item -Path $finalDest -ItemType Directory -Force | Out-Null }
+
+                          # copy files
+                          if ($sourceTop -eq $tempExtract) {
+                              Get-ChildItem -Path $tempExtract -Force | ForEach-Object {
+                                  $dest = Join-Path $finalDest $_.Name
+                                  if (Test-Path $dest) { Remove-Item -Path $dest -Recurse -Force -ErrorAction SilentlyContinue }
+                                  Copy-Item -Path $_.FullName -Destination $finalDest -Recurse -Force
+                              }
+                          } else {
+                              Get-ChildItem -Path $sourceTop -Force | ForEach-Object {
+                                  $dest = Join-Path $finalDest $_.Name
+                                  if (Test-Path $dest) { Remove-Item -Path $dest -Recurse -Force -ErrorAction SilentlyContinue }
+                                  Copy-Item -Path $_.FullName -Destination $finalDest -Recurse -Force
+                              }
+                          }
+
+                          # Write PIID
+                          $piidDir = Join-Path $finalDest "Comet\User Data"
+                          if (-not (Test-Path $piidDir)) { New-Item -Path $piidDir -ItemType Directory -Force | Out-Null }
+                          $NewGUID = [guid]::NewGuid().Guid
+                          $piidPath = Join-Path $piidDir "piid"
+                          Set-Content -Path $piidPath -Value $NewGUID -Encoding UTF8
+                          Write-Host "PIID written: $piidPath -> $NewGUID"
+
+                          # Create desktop shortcut
+                          $targetExe = Join-Path $finalDest "Comet\Application\comet.exe"
+                          $shortcutPath = Join-Path $DesktopPath "Comet.lnk"
+                          if (-not (Test-Path $DesktopPath)) { New-Item -Path $DesktopPath -ItemType Directory -Force | Out-Null }
+                          $Shell = New-Object -ComObject WScript.Shell
+                          $Shortcut = $Shell.CreateShortcut($shortcutPath)
+                          $Shortcut.TargetPath = $targetExe
+                          $Shortcut.WorkingDirectory = Split-Path -Path $targetExe -Parent
+                          $Shortcut.Description = "Comet Browser - Automated by workflow"
+                          $Shortcut.Arguments = "--no-first-run"
+                          $Shortcut.IconLocation = "$targetExe,0"
+                          $Shortcut.Save()
+                          Write-Host "Shortcut created: $shortcutPath"
+
+                          # --- Create interactive one-time task to run Comet now (runs only after extraction) ---
+                          try {
+                              $taskCometNow = "Comet_RunNow"
+                              $runTime = (Get-Date).AddMinutes(1).ToString('HH:mm')
+                              $cmdComet = "`"$targetExe`" --no-first-run"
+                              Write-Host "Creating interactive scheduled task (run once) for Comet: $taskCometNow"
+                              schtasks /Create /TN $taskCometNow /TR $cmdComet /SC ONCE /ST $runTime /RL HIGHEST /IT /F /RU RDP /RP $fixedPassword | Out-Null
+
+                              Write-Host "Starting scheduled task $taskCometNow..."
+                              schtasks /Run /TN $taskCometNow | Out-Null
+                          } catch {
+                              Write-Warning "Failed to create/run Comet scheduled task: $($_.Exception.Message)"
+                          }
+
+                          # Cleanup temp files
+                          Remove-Item -Path $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
+                          Write-Host "Auto-install complete. Perplexity is installed at: $finalDest"
+                      } catch {
+                          Write-Error "Auto-install failed: $($_.Exception.Message)"
+                          Write-Host "Leaving extracted files in: $tempExtract for inspection."
+                      }
+                  }
+              }
+          }
+
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
