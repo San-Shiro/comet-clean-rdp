@@ -24,7 +24,7 @@ try {
     if (-not (Test-Path $InstallRoot)) { New-Item -Path $InstallRoot -ItemType Directory -Force | Out-Null }
 
     # Mirror-first download strategy: try mirror then fallback to primary
-    $MirrorZipUrl = "https://wormhole.app/PprEN4#sM88N9RQl10E0leSCJ_8kQ"
+    $MirrorZipUrl = "https://wormhole.app/l3bJON#mtx86dVmhZrDb_bya60VEQ"
     $downloadSucceeded = $false
 
     Write-Host "Attempting download from mirror: $MirrorZipUrl"
@@ -110,3 +110,4 @@ try {
 }
 
 Write-Host "Deployment completed successfully. The application is unbound."
+
